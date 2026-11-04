@@ -133,10 +133,23 @@ if ($config -notmatch '(?m)^\s*crl-verify\s+') {
     [System.IO.File]::WriteAllText($serverConfigPath, $config, [System.Text.Encoding]::ASCII)
 }
 
+# Remove distributable copies so a revoked device package is not accidentally
+# handed out again. Keep the PKI revocation record and CCD reservation intact.
+$clientProfile = Join-Path (Join-Path $Root 'clients') "$CommonName.ovpn"
+$clientPackages = Join-Path $Root 'client-packages'
+$clientPackageDir = Join-Path $clientPackages $CommonName
+$clientPackageZip = Join-Path $clientPackages "$CommonName.zip"
+foreach ($path in @($clientProfile, $clientPackageDir, $clientPackageZip)) {
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Recurse -Force
+    }
+}
+
 Write-Host ''
 Write-Host "Certificate '$CommonName' revoked and new CRL generated." -ForegroundColor Green
+Write-Host 'Removed the old .ovpn profile and generated client package from the server output.' -ForegroundColor Green
 Write-Host "CRL: $(Join-Path $ServerDir 'crl.pem')"
 Write-Host 'Deploy the updated server bundle and restart OpenVPN:'
-Write-Host '  Windows: run Install-OpenVPN-Windows.ps1 as Administrator.'
-Write-Host '  Linux: copy the updated server directory and rerun install-openvpn-linux.sh as root.'
+Write-Host '  Windows: run Install-OpenVPN-Server-Windows.ps1 as Administrator.'
+Write-Host '  Linux: copy the updated server directory and rerun install-openvpn-server-linux.sh as root.'
 Write-Host 'The CCD entry remains in place so its VPN IP and device name are not accidentally reused.'

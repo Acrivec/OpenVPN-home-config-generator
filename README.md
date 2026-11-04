@@ -1,118 +1,136 @@
 # OpenVPN Home Server Kit
 
-A small PowerShell/Bash toolkit for creating and deploying an OpenVPN server, issuing per-device client profiles, and revoking lost or retired clients.
+A small PowerShell/Bash toolkit to create an OpenVPN server, issue one certificate/profile per device, deploy the server on Windows or Linux, install clients, and revoke client certificates.
 
-## What it does
+## How it works
 
-- Creates an IPv4 VPN using the **TAP-Windows virtual Ethernet adapter** on Windows and UDP (default port `12321`).
-- Assigns the server the first usable address in the VPN subnet and gives each client a persistent address through CCD files.
-- Enables client-to-client communication.
-- Uses TAP (virtual Ethernet) on Windows; this kit does not configure a physical-LAN bridge.
-- Creates a Certificate Authority (CA), server certificate, unique client certificates, and self-contained `.ovpn` profiles.
-- Supports a Windows server or a systemd-based Linux server.
-- Provides a separate client-certificate revocation script.
+1. Run the generator **on the server-side Windows machine**. It creates/reuses the CA and server identity, then creates one client certificate, static VPN address, and `.ovpn` profile per run.
+2. Install the server with the Windows or Linux server installer.
+3. Transfer only the generated `client-packages/<device>.zip` to that device. The ZIP contains that device's `.ovpn` profile, Windows/Linux client installers, and instructions. It contains no server bundle, server private key, CA private key, or Easy-RSA database.
+4. Run the matching client installer on the device.
 
-Default VPN network: `192.168.4.0/24` — server `192.168.4.1`, first client `192.168.4.2`.
+Default VPN network: `192.168.4.0/24` (server `192.168.4.1`, first client `192.168.4.2`). Default UDP port: `12321`.
 
 ## Requirements
 
-### Generate certificates and profiles
+- **Generator:** Windows PowerShell 5.1+, internet access on first run to download the official Easy-RSA 3.2.7 Windows bundle (SHA-256 is verified).
+- **Windows server:** OpenVPN Community 2.6+ already installed, including `OpenVPNService` and the TAP-Windows driver. The server installer does not install or upgrade OpenVPN.
+- **Linux server/client:** systemd-based Linux distribution and root/sudo access. Installers support `apt`, `dnf`, `yum`, `pacman`, and `zypper` package managers.
+- **Windows client:** Windows 10/11, PowerShell 5.1+, and Administrator rights. If OpenVPN is missing, the client installer downloads the official OpenVPN Community 2.7.8-I002 MSI and verifies its release signature before installing. If OpenVPN is already present but its background service is missing, the script asks before modifying/upgrading it to add the service and drivers. GnuPG/Gpg4win may be needed if the MSI does not expose a valid Authenticode signature.
 
-- Windows PowerShell 5.1 or newer.
-- Internet access on first run to download the official Easy-RSA 3.2.7 Windows bundle. The generator verifies its SHA-256 before extracting it.
+## Generate the server and first client
+
+Run from the kit directory on the Windows machine that will hold the CA and server files:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\New-OpenVPN-VPN.ps1
+```
+
+On first run, choose a strong CA passphrase and keep it safe. The generator asks for the VPN network/prefix, UDP port, public IPv4 address or DDNS hostname, and device name. Defaults are saved for later runs. Each successful run adds one client.
+
+## Install the server
 
 ### Windows server
 
-- OpenVPN Community already installed, including `OpenVPNService` and the TAP-Windows driver.
-- OpenVPN **2.6.0 or newer**.
-- Run the Windows installer from an elevated PowerShell session.
+Run from an elevated PowerShell window on the server:
 
-The Windows installer configures an existing OpenVPN installation; it does **not** download, install, upgrade, or uninstall OpenVPN.
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\Install-OpenVPN-Server-Windows.ps1
+```
+
+Select the TAP-Windows adapter by its exact Windows network adapter name when prompted. The installer deploys the generated server files to OpenVPN's `config-auto` directory, configures the OpenVPN service, service ACLs and log/status paths, adds the inbound UDP firewall rule, and checks the daemon startup log. It uses the existing OpenVPN installation; it does not download, install, upgrade, or uninstall OpenVPN.
 
 ### Linux server
 
-- A systemd-based Linux distribution.
-- Root/sudo access. The Linux installer can install OpenVPN through `apt`, `dnf`, `yum`, `pacman`, or `zypper` if it is not already installed. It supports OpenVPN 2.5 or newer.
-
-## Quick start — Windows
-
-1. Open PowerShell in the kit directory and run:
-
-   ```powershell
-   Set-ExecutionPolicy -Scope Process Bypass -Force
-   .\New-OpenVPN-VPN.ps1
-   ```
-
-2. On first run, choose a strong CA passphrase and keep it safe. The generator then asks for the VPN network/prefix, UDP port, public IPv4 address or DDNS hostname, and a device name. Defaults are saved and offered on later runs.
-
-3. Run the Windows installer as Administrator:
-
-   ```powershell
-   .\Install-OpenVPN-Windows.ps1
-   ```
-
-4. Select the TAP-Windows adapter by its exact Windows network adapter name when prompted. The selected name is saved for later installer runs.
-
-5. Configure your router to forward the chosen **UDP** port to the server PC's physical LAN IPv4 address. Give that LAN address a DHCP reservation or static assignment.
-
-6. Import the matching file from `OpenVPN-VPN\clients\` into the OpenVPN app on each device. Each device must use its own profile.
-
-The Windows installer deploys the server bundle to `C:\Program Files\OpenVPN\config-auto`, configures the OpenVPN system service to start automatically, adds a Windows Firewall inbound rule for the selected UDP port, and checks the daemon log for `Initialization Sequence Completed`. It also sets the selected TAP adapter's Windows network category to **Private** after successful initialization. It does not change the physical Ethernet/Wi-Fi adapter.
-
-For OpenVPN 2.7, the installer reads the log directory from `HKLM\SOFTWARE\OpenVPN\log_dir` (commonly `C:\ProgramData\OpenVPN\Log`). It explicitly grants `NT SERVICE\OpenVPNService` the required runtime read/traverse permissions, grants log-directory write access, and puts the status file in that writable log directory. Server private keys remain readable by the service but restricted from ordinary users. The installed Windows config uses absolute credential paths and the selected TAP adapter; the generated `server.ovpn` remains portable for Linux deployment.
-
-## Linux deployment
-
-Copy the generated `OpenVPN-VPN/server` directory and `install-openvpn-linux.sh` to the Linux host. From the kit directory, run:
+Copy the generated `OpenVPN-VPN/server` directory and `install-openvpn-server-linux.sh` to the Linux server. Then run:
 
 ```bash
-sudo ./install-openvpn-linux.sh /path/to/OpenVPN-VPN/server
+sudo bash ./install-openvpn-server-linux.sh /path/to/server
 ```
 
-The script installs OpenVPN if needed, deploys the server config/certificates/keys/CCD files, enables and starts the appropriate systemd unit, and opens the UDP port in UFW or firewalld when one is active. Router port forwarding to the Linux host is still required.
+The script installs OpenVPN from the distribution repository if needed, deploys the server files and CCD assignments, enables/starts the systemd server unit, and opens the UDP port in UFW or firewalld when one is active.
 
-## Add devices and change settings
+### Router
 
-Run `New-OpenVPN-VPN.ps1` again to add another device. It reuses the existing CA, server identity, and TLS control-channel key, then creates a new client certificate, CCD assignment, and self-contained `.ovpn` profile. **Each successful run creates one additional client profile.** After adding a device, rerun the relevant server installer so the new CCD entry is deployed.
+Forward the selected **UDP** port to the server's physical LAN IPv4 address. Reserve that address in DHCP or configure it statically. The VPN cannot accept remote connections until this is done.
 
-The generator supports VPN prefixes `/16` through `/30` and displays the address/client capacity for each. The network address must be the actual network boundary for the selected prefix. The server uses network + 1; clients use network + 2 onward. Changing the VPN subnet updates existing CCD assignments while preserving addresses where possible; it does not require new client certificates or profiles. Restart/redeploy the server after changing settings.
+## Install a client
 
-Choose a VPN subnet that does not overlap the server's LAN or networks commonly used by client devices. The configuration routes the VPN subnet only: it does **not** redirect all Internet traffic and does **not** automatically provide access to the server's physical home LAN. Client-to-client communication inside the VPN is enabled.
+After generation, the server creates:
+
+```text
+OpenVPN-VPN/
+  clients/<device>.ovpn
+  client-packages/
+    <device>.zip
+    <device>/
+      <device>.ovpn
+      Install-OpenVPN-Client-Windows.ps1
+      install-openvpn-client-linux.sh
+      README.txt
+```
+
+Transfer only the device's ZIP to the client machine. Extract it there.
+
+**Windows client** — open PowerShell as Administrator in the extracted directory:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\Install-OpenVPN-Client-Windows.ps1
+```
+
+The script installs OpenVPN Community if missing, including its GUI, background service, and network drivers. It copies the profile into OpenVPN's `config-auto` directory, restricts access to the embedded private key, and configures `OpenVPNService` for automatic connection at system startup. If an existing installation lacks `OpenVPNService`, it asks before modifying/upgrading that installation. Existing installations with the service already present are left at their current version. To use another profile path, pass `-ProfilePath .\device.ovpn`.
+
+**Linux client** — from the extracted directory:
+
+```bash
+sudo bash ./install-openvpn-client-linux.sh
+```
+
+The script installs OpenVPN from the distribution repository if needed, puts the profile in the appropriate systemd client configuration directory, and enables/starts the client service. To use another profile path, pass it as the first argument.
+
+Connection status on Linux:
+
+```bash
+sudo systemctl status openvpn-client@homevpn-<device>.service
+sudo journalctl -u openvpn-client@homevpn-<device>.service -n 60 --no-pager
+```
+
+The exact unit name is printed by the installer. On older distributions it may use `openvpn@homevpn-<device>` instead.
+
+## Add devices or change settings
+
+Run `New-OpenVPN-VPN.ps1` again on the server and enter a new device name. It reuses the existing CA, server identity, and TLS control-channel key, then creates the new certificate, CCD assignment, `.ovpn` profile, and client ZIPs. Existing client packages are rebuilt on each generator run, so endpoint changes are included in the refreshed ZIPs.
+
+After adding a client, rerun the relevant **server installer** so the new CCD entry is deployed. The generator supports VPN prefixes `/16` through `/30`; the server uses network + 1 and clients use network + 2 onward. Avoid subnet overlap with the server LAN and networks commonly used by clients.
+
+The configuration routes the VPN subnet only. It does **not** redirect all Internet traffic and does **not** automatically provide access to the server's physical home LAN. Client-to-client communication inside the VPN is enabled. The Windows server installer uses a TAP-Windows virtual Ethernet adapter; Windows clients use their installed OpenVPN client driver. This kit does not create a physical-LAN bridge.
 
 ## Revoke a client
 
-Run from PowerShell in the kit directory:
+Run on the server-side Windows machine:
 
 ```powershell
 .\Revoke-OpenVPN-Client.ps1 -CommonName phone
 ```
 
-Replace `phone` with the device name used when its certificate was created. The script asks for explicit confirmation and the CA passphrase, revokes the certificate, generates a new CRL, and updates the source server bundle. Deploy the updated bundle and restart OpenVPN by rerunning the Windows or Linux installer. The CCD entry is retained so its VPN address is not accidentally reassigned.
+Replace `phone` with the device's certificate name. The script asks for confirmation and the CA passphrase, revokes the certificate, generates a new CRL, and updates the server bundle. It also removes that device's generated `.ovpn` profile and client ZIP so they are not accidentally redistributed. Rerun the relevant server installer to deploy the updated CRL and restart OpenVPN. The CCD entry and PKI revocation record are retained so the VPN address is not accidentally reassigned.
 
-## Generated files and security
-
-The generator creates:
-
-```text
-OpenVPN-VPN/
-  server/       Server config, certificates/keys, CCD entries, optional CRL
-  clients/      One self-contained .ovpn profile per device
-  easy-rsa/     Easy-RSA program files and the CA/PKI database
-  server-settings.json
-  server-endpoint.txt
-```
-
-- The CA private key (`easy-rsa/.../pki/private/ca.key`) is encrypted with the CA passphrase. It is used to issue and revoke certificates and is **not** copied to the server runtime directory.
-- `server.key` and client private keys are unencrypted so the server and clients can start without an interactive key-password prompt.
-- Each `.ovpn` profile embeds that device's private key and certificate, the public CA certificate, and the shared `tls-crypt` key. Treat the whole profile as a secret and transfer it securely. Do not reuse one device's profile on another device.
-- Keep a secure backup of the **entire Easy-RSA `pki` directory** and the CA passphrase. Without the CA key/database, issuing or revoking clients later may not be possible.
-- Keep secure backups of the server bundle and each client profile. Do not commit generated keys, profiles, or the PKI directory to a public Git repository.
-
-## Kit files
+## Files and security
 
 | File | Purpose |
 |---|---|
-| `New-OpenVPN-VPN.ps1` | Creates/reuses the CA and server identity; generates a client certificate, static address assignment, and `.ovpn` profile. |
-| `Install-OpenVPN-Windows.ps1` | Deploys the server to an existing Windows OpenVPN installation and configures its service, TAP adapter, ACLs, log/status paths, and firewall rule. |
-| `install-openvpn-linux.sh` | Installs/deploys the server on a systemd-based Linux host. |
-| `Revoke-OpenVPN-Client.ps1` | Revokes a client certificate and generates the updated CRL. |
+| `New-OpenVPN-VPN.ps1` | Creates/reuses the CA and server identity; generates client certificates, profiles, CCD entries, and per-device ZIP packages. |
+| `Install-OpenVPN-Server-Windows.ps1` | Deploys the server on an existing Windows OpenVPN installation. |
+| `install-openvpn-server-linux.sh` | Installs/deploys the server on a systemd-based Linux host. |
+| `Install-OpenVPN-Client-Windows.ps1` | Installs/configures a Windows client from one `.ovpn` profile. |
+| `install-openvpn-client-linux.sh` | Installs/configures a Linux client from one `.ovpn` profile. |
+| `Revoke-OpenVPN-Client.ps1` | Revokes a client certificate and generates an updated CRL. |
+
+- The encrypted CA private key is stored under `OpenVPN-VPN/easy-rsa/.../pki` and is not copied to the server runtime directory or client ZIPs.
+- `server.key` and client private keys are unencrypted so their services can start without an interactive key-password prompt.
+- Each `.ovpn` profile embeds the device private key and certificate, public CA certificate, and shared `tls-crypt` key. Treat the profile and its ZIP as secrets. Transfer them securely, do not reuse profiles between devices, and remove obsolete copies.
+- Keep a secure backup of the entire Easy-RSA `pki` directory and the CA passphrase. Without them, issuing/revoking clients later may not be possible.
+- Do not commit generated keys, profiles, client ZIPs, or the PKI directory to a public Git repository.

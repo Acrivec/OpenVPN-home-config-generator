@@ -473,6 +473,68 @@ $tlsCrypt
     Write-Info "Assigned VPN address: $Address"
 }
 
+function New-ClientDistributionPackages {
+    $windowsInstaller = Join-Path $PSScriptRoot 'Install-OpenVPN-Client-Windows.ps1'
+    $linuxInstaller = Join-Path $PSScriptRoot 'install-openvpn-client-linux.sh'
+    foreach ($installer in @($windowsInstaller, $linuxInstaller)) {
+        if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Client installer is missing: $installer. Keep both client installer scripts beside New-OpenVPN-VPN.ps1."
+        }
+    }
+
+    $packageRoot = Join-Path $Root 'client-packages'
+    New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+    # Rebuild this generated distribution directory from the profiles that
+    # currently exist. This prevents stale ZIPs surviving manual profile removal.
+    Get-ChildItem -LiteralPath $packageRoot -Force -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force
+    $profiles = @(Get-ChildItem -Path $ClientsDir -Filter '*.ovpn' -File | Sort-Object Name)
+    foreach ($profile in $profiles) {
+        $clientName = [IO.Path]::GetFileNameWithoutExtension($profile.Name)
+        $clientPackageDir = Join-Path $packageRoot $clientName
+        if (Test-Path -LiteralPath $clientPackageDir) {
+            Remove-Item -LiteralPath $clientPackageDir -Recurse -Force
+        }
+        New-Item -ItemType Directory -Path $clientPackageDir -Force | Out-Null
+        Copy-Item -LiteralPath $profile.FullName -Destination (Join-Path $clientPackageDir $profile.Name) -Force
+        Copy-Item -LiteralPath $windowsInstaller -Destination $clientPackageDir -Force
+        Copy-Item -LiteralPath $linuxInstaller -Destination $clientPackageDir -Force
+
+        $packageReadme = @"
+OpenVPN client package: $clientName
+
+This package contains only this device's private VPN profile and the client installers.
+It does not contain the server configuration, server private key, CA private key, or Easy-RSA database.
+
+WINDOWS
+1. Extract this ZIP on the Windows client.
+2. Open PowerShell as Administrator in the extracted folder.
+3. Run:
+   Set-ExecutionPolicy -Scope Process Bypass -Force
+   .\Install-OpenVPN-Client-Windows.ps1
+The installer uses an existing OpenVPN Community installation, or installs it if missing.
+If an existing installation lacks OpenVPNService, it asks before modifying/upgrading it to add the service and drivers.
+The VPN service is configured to connect at system startup.
+
+LINUX
+1. Extract this ZIP on the Linux client.
+2. From the extracted folder, run:
+   sudo bash ./install-openvpn-client-linux.sh
+The installer uses the distribution package manager if OpenVPN is missing and enables the systemd client service.
+
+SECURITY
+The .ovpn file contains this device's client certificate, private key, CA certificate, and shared TLS control-channel key.
+Treat this whole ZIP as a password-equivalent secret. Transfer it securely, keep it private, and do not reuse it on another device.
+"@
+        [System.IO.File]::WriteAllText((Join-Path $clientPackageDir 'README.txt'), $packageReadme, [System.Text.Encoding]::UTF8)
+
+        $archivePath = Join-Path $packageRoot ($clientName + '.zip')
+        if (Test-Path -LiteralPath $archivePath) { Remove-Item -LiteralPath $archivePath -Force }
+        Compress-Archive -Path (Join-Path $clientPackageDir '*') -DestinationPath $archivePath -CompressionLevel Optimal -Force
+        Write-Info "Client distribution package created: $archivePath"
+    }
+}
+
 # Prepare output structure.
 New-Item -ItemType Directory -Path $Root, $ServerDir, $CcdDir, $ClientsDir -Force | Out-Null
 $script:EasyRSAStart = Get-EasyRSAStart
@@ -610,11 +672,13 @@ if (-not (Test-Path $clientCertPath) -or -not (Test-Path $clientKeyPath)) {
 $ccdContent = "ifconfig-push $vpnAddress $script:VpnMask`r`n"
 [System.IO.File]::WriteAllText((Join-Path $CcdDir $commonName), $ccdContent, [System.Text.Encoding]::ASCII)
 Write-ClientProfile -CommonName $commonName -Address $vpnAddress -Endpoint $endpoint
+New-ClientDistributionPackages
 
 Write-Host ''
 Write-Host 'Generation complete.' -ForegroundColor Green
 Write-Host "Server bundle: $ServerDir"
 Write-Host "Client import file: $(Join-Path $ClientsDir "$commonName.ovpn")"
+Write-Host "Client package ZIP: $(Join-Path (Join-Path $Root 'client-packages') "$commonName.zip")"
 Write-Host "Server tunnel address: $(Get-ServerVpnAddress)"
 Write-Host "Client tunnel address: $vpnAddress"
 Write-Host ''
