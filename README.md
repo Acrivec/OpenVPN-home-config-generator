@@ -1,12 +1,13 @@
 # OpenVPN Home Server Kit
 
-A small PowerShell/Bash toolkit for creating and deploying a routed OpenVPN server, issuing per-device client profiles, and revoking lost or retired clients.
+A small PowerShell/Bash toolkit for creating and deploying an OpenVPN server, issuing per-device client profiles, and revoking lost or retired clients.
 
 ## What it does
 
-- Creates an IPv4 **TUN** VPN using UDP (default port `12321`).
+- Creates an IPv4 VPN using the **TAP-Windows virtual Ethernet adapter** on Windows and UDP (default port `12321`).
 - Assigns the server the first usable address in the VPN subnet and gives each client a persistent address through CCD files.
 - Enables client-to-client communication.
+- Uses TAP (virtual Ethernet) on Windows; this kit does not configure a physical-LAN bridge.
 - Creates a Certificate Authority (CA), server certificate, unique client certificates, and self-contained `.ovpn` profiles.
 - Supports a Windows server or a systemd-based Linux server.
 - Provides a separate client-certificate revocation script.
