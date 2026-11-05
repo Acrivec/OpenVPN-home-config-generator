@@ -1,17 +1,81 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 [CmdletBinding()]
-param()
+param([string]$ServerName)
 
 $ErrorActionPreference = 'Stop'
-$Root = Join-Path $PSScriptRoot 'OpenVPN-VPN'
-$EasyRSAInstall = Join-Path $Root 'easy-rsa'
-$PkiDir = $null
-$ServerDir = Join-Path $Root 'server'
-$CcdDir = Join-Path $ServerDir 'ccd'
-$ClientsDir = Join-Path $Root 'clients'
-$EndpointFile = Join-Path $Root 'server-endpoint.txt'
+$KitRoot = Join-Path $PSScriptRoot 'OpenVPN-VPN'
+$ServersRoot = Join-Path $KitRoot 'servers'
+$EasyRSAInstall = Join-Path $KitRoot 'easy-rsa'
 $EasyRSAUrl = 'https://github.com/OpenVPN/easy-rsa/releases/download/v3.2.7/EasyRSA-3.2.7-win64.zip'
 $EasyRSAZipSha256 = '2f20c7523fe37df91c578c35e7fe83301f3687792bb9bd1000d0e407ef70d368'
+
+function Test-ServerId([string]$Value) {
+    return ($Value -match '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$')
+}
+
+# Migrate the v3-v12 single-server layout without replacing its CA or certificates.
+# The Easy-RSA application remains shared; its PKI moves into servers/<id>/pki.
+$legacyPki = $null
+$legacyStart = Get-ChildItem -Path $EasyRSAInstall -Filter 'EasyRSA-Start.bat' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($legacyStart) {
+    $candidatePki = Join-Path (Split-Path -Parent $legacyStart.FullName) 'pki'
+    if (Test-Path (Join-Path $candidatePki 'private\ca.key')) { $legacyPki = $candidatePki }
+}
+$configuredServers = @()
+if (Test-Path -LiteralPath $ServersRoot) {
+    $configuredServers = @(Get-ChildItem -LiteralPath $ServersRoot -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path (Join-Path $_.FullName 'server-settings.json') })
+}
+$legacyLayout = (($legacyPki -or (Test-Path (Join-Path $KitRoot 'server'))) -and $configuredServers.Count -eq 0)
+if ($legacyLayout) {
+    $ServerName = if ($PSBoundParameters.ContainsKey('ServerName') -and $ServerName) { $ServerName } else { 'default' }
+    if (-not (Test-ServerId $ServerName)) { throw 'Server name must be 1-32 characters: letters, digits, underscore or hyphen.' }
+    $ServerName = $ServerName.ToLowerInvariant()
+    $ServerHome = Join-Path $ServersRoot $ServerName
+    New-Item -ItemType Directory -Path $ServerHome -Force | Out-Null
+    if ($legacyPki) {
+        $newPki = Join-Path $ServerHome 'pki'
+        if (-not (Test-Path $newPki)) { Move-Item -LiteralPath $legacyPki -Destination $newPki }
+    }
+    foreach ($entry in @(
+        @{ Old = 'server'; New = 'server' },
+        @{ Old = 'clients'; New = 'clients' },
+        @{ Old = 'client-packages'; New = 'client-packages' },
+        @{ Old = 'server-settings.json'; New = 'server-settings.json' },
+        @{ Old = 'server-endpoint.txt'; New = 'server-endpoint.txt' }
+    )) {
+        $source = Join-Path $KitRoot $entry.Old
+        $destination = Join-Path $ServerHome $entry.New
+        if ((Test-Path -LiteralPath $source) -and -not (Test-Path -LiteralPath $destination)) {
+            Move-Item -LiteralPath $source -Destination $destination
+        }
+    }
+    Write-Host "Migrated the existing single-server data into OpenVPN-VPN\servers\$ServerName without regenerating its CA." -ForegroundColor Green
+}
+else {
+    New-Item -ItemType Directory -Path $ServersRoot -Force | Out-Null
+    if ([string]::IsNullOrWhiteSpace($ServerName)) {
+        $existing = @(Get-ChildItem -LiteralPath $ServersRoot -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'server-settings.json') } | Sort-Object Name)
+        if ($existing.Count -gt 0) {
+            Write-Host 'Existing server configurations:' -ForegroundColor Cyan
+            foreach ($item in $existing) { Write-Host "  $($item.Name)" }
+            Write-Host 'Enter an existing name to update it, or a new name to create another server.' -ForegroundColor DarkGray
+        }
+        $defaultServerName = if ($existing.Count -eq 0) { 'home' } else { $existing[0].Name }
+        $ServerName = Read-Host "Server configuration name [$defaultServerName]"
+        if ([string]::IsNullOrWhiteSpace($ServerName)) { $ServerName = $defaultServerName }
+    }
+    if (-not (Test-ServerId $ServerName)) { throw 'Server name must be 1-32 characters: letters, digits, underscore or hyphen.' }
+    $ServerName = $ServerName.ToLowerInvariant()
+}
+
+$ServerHome = Join-Path $ServersRoot $ServerName
+$Root = $ServerHome
+$ServerDir = Join-Path $ServerHome 'server'
+$CcdDir = Join-Path $ServerDir 'ccd'
+$EndpointFile = Join-Path $ServerHome 'server-endpoint.txt'
+$PkiDir = Join-Path $ServerHome 'pki'
+$script:EasyRSAHome = $null
+$script:CaPassphrase = $null
 
 function Write-Info([string]$Message) { Write-Host "[+] $Message" -ForegroundColor Cyan }
 function Write-Warn([string]$Message) { Write-Host "[!] $Message" -ForegroundColor Yellow }
@@ -155,49 +219,6 @@ function New-TlsCryptKey([string]$Path) {
     ) + $keyLines + @('-----END OpenVPN Static key V1-----')
     [System.IO.File]::WriteAllText($Path, ($contents -join "`r`n") + "`r`n", [System.Text.Encoding]::ASCII)
 }
-
-function Get-NextVpnAddress {
-    $used = @{}
-    if (Test-Path $CcdDir) {
-        Get-ChildItem $CcdDir -File | ForEach-Object {
-            $content = Get-Content $_.FullName -Raw
-            if ($content -match 'ifconfig-push\s+\S+\.(\d+)\s+') { $used[[int]$Matches[1]] = $true }
-        }
-    }
-    $maxHost = [Math]::Min(254, [Math]::Pow(2, 32 - $script:VpnPrefix) - 2)
-    foreach ($hostIndex in 2..$maxHost) {
-        if (-not $used.ContainsKey($hostIndex)) { return (Get-ClientVpnAddressFromIndex $hostIndex) }
-    }
-    throw 'No free client IP addresses remain in the selected subnet.'
-}
-function Get-ClientCommonName {
-    param([string]$DefaultName)
-    while ($true) {
-        $raw = Read-Host "Device name / certificate name [$DefaultName]"
-        if ([string]::IsNullOrWhiteSpace($raw)) { $raw = $DefaultName }
-        $cn = $raw.Trim().ToLowerInvariant() -replace '[^a-z0-9_-]+', '-'
-        $cn = $cn.Trim('-')
-        if ([string]::IsNullOrWhiteSpace($cn) -or $cn.Length -gt 32 -or $cn -notmatch '^[a-z0-9][a-z0-9_-]*$') {
-            Write-Warn 'Use 1-32 characters: a-z, 0-9, underscore or hyphen.'
-            continue
-        }
-        $reservedNames = @('server', 'ca', 'easyrsa-tls')
-        $existingCert = Join-Path $PkiDir "issued\$cn.crt"
-        $existingKey = Join-Path $PkiDir "private\$cn.key"
-        $existingRequest = Join-Path $PkiDir "reqs\$cn.req"
-        $recoverablePartial = (Test-Path $existingKey) -and (Test-Path $existingRequest) -and -not (Test-Path $existingCert)
-        $nameAlreadyUsed = (Test-Path (Join-Path $CcdDir $cn)) -or (Test-Path $existingCert) -or ((Test-Path $existingKey) -and -not $recoverablePartial) -or ((Test-Path $existingRequest) -and -not $recoverablePartial)
-        if (($reservedNames -contains $cn) -or $nameAlreadyUsed) {
-            Write-Warn "The name '$cn' is reserved or already exists in the PKI. Choose a different device name."
-            continue
-        }
-        if ($recoverablePartial) {
-            Write-Info "Found an incomplete key/request for '$cn'; the generator can finish signing it."
-        }
-        return $cn
-    }
-}
-
 
 function ConvertTo-IPv4Number([string]$Address) {
     $bytes = ([System.Net.IPAddress]::Parse($Address)).GetAddressBytes()
@@ -380,32 +401,6 @@ function Update-ExistingClientAddresses {
     }
 }
 
-function Get-NextVpnAddress {
-    $used = @{}
-    if (Test-Path $CcdDir) {
-        Get-ChildItem -Path $CcdDir -File | ForEach-Object {
-            $content = Get-Content $_.FullName -Raw
-            if ($content -match '(?m)^ifconfig-push\s+((?:\d{1,3}\.){3}\d{1,3})\s+') {
-                try {
-                    $offset = (ConvertTo-IPv4Number $Matches[1]) - $script:VpnNetworkBase
-                    if ($offset -ge 2 -and $offset -le ($script:VpnTotalAddresses - 2)) {
-                        $used[[int]$offset] = $true
-                    }
-                }
-                catch { }
-            }
-        }
-    }
-
-    $maxHost = $script:VpnTotalAddresses - 2
-    for ($hostIndex = 2; $hostIndex -le $maxHost; $hostIndex++) {
-        if (-not $used.ContainsKey($hostIndex)) {
-            return (Get-ClientVpnAddressFromIndex $hostIndex)
-        }
-    }
-    throw 'No free client IP addresses remain in the selected subnet.'
-}
-
 function Read-ServerEndpoint {
     $oldEndpoint = ''
     if (Test-Path $EndpointFile) { $oldEndpoint = (Get-Content $EndpointFile -Raw).Trim() }
@@ -429,117 +424,11 @@ function Read-ServerEndpoint {
     }
 }
 
-function Write-ClientProfile {
-    param(
-        [string]$CommonName,
-        [string]$Address,
-        [string]$Endpoint
-    )
-    $ca = (Get-Content -Path (Join-Path $PkiDir 'ca.crt') -Raw).Trim()
-    $cert = (Get-Content -Path (Join-Path $PkiDir "issued\$CommonName.crt") -Raw).Trim()
-    $key = (Get-Content -Path (Join-Path $PkiDir "private\$CommonName.key") -Raw).Trim()
-    $tlsCrypt = (Get-Content -Path (Join-Path $PkiDir 'private\easyrsa-tls.key') -Raw).Trim()
-
-    $profile = @"
-client
-dev tun
-proto udp
-remote $Endpoint $script:VpnPort udp
-resolv-retry infinite
-nobind
-persist-tun
-remote-cert-tls server
-tls-version-min 1.2
-data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
-auth-nocache
-verb 3
-
-<ca>
-$ca
-</ca>
-<cert>
-$cert
-</cert>
-<key>
-$key
-</key>
-<tls-crypt>
-$tlsCrypt
-</tls-crypt>
-"@
-    $profilePath = Join-Path $ClientsDir "$CommonName.ovpn"
-    [System.IO.File]::WriteAllText($profilePath, $profile, [System.Text.Encoding]::ASCII)
-    Write-Info "Client profile created: $profilePath"
-    Write-Info "Assigned VPN address: $Address"
-}
-
-function New-ClientDistributionPackages {
-    $windowsInstaller = Join-Path $PSScriptRoot 'Install-OpenVPN-Client-Windows.ps1'
-    $linuxInstaller = Join-Path $PSScriptRoot 'install-openvpn-client-linux.sh'
-    foreach ($installer in @($windowsInstaller, $linuxInstaller)) {
-        if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
-            throw "Client installer is missing: $installer. Keep both client installer scripts beside New-OpenVPN-VPN.ps1."
-        }
-    }
-
-    $packageRoot = Join-Path $Root 'client-packages'
-    New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
-    # Rebuild this generated distribution directory from the profiles that
-    # currently exist. This prevents stale ZIPs surviving manual profile removal.
-    Get-ChildItem -LiteralPath $packageRoot -Force -ErrorAction SilentlyContinue |
-        Remove-Item -Recurse -Force
-    $profiles = @(Get-ChildItem -Path $ClientsDir -Filter '*.ovpn' -File | Sort-Object Name)
-    foreach ($profile in $profiles) {
-        $clientName = [IO.Path]::GetFileNameWithoutExtension($profile.Name)
-        $clientPackageDir = Join-Path $packageRoot $clientName
-        if (Test-Path -LiteralPath $clientPackageDir) {
-            Remove-Item -LiteralPath $clientPackageDir -Recurse -Force
-        }
-        New-Item -ItemType Directory -Path $clientPackageDir -Force | Out-Null
-        Copy-Item -LiteralPath $profile.FullName -Destination (Join-Path $clientPackageDir $profile.Name) -Force
-        Copy-Item -LiteralPath $windowsInstaller -Destination $clientPackageDir -Force
-        Copy-Item -LiteralPath $linuxInstaller -Destination $clientPackageDir -Force
-
-        $packageReadme = @"
-OpenVPN client package: $clientName
-
-This package contains only this device's private VPN profile and the client installers.
-It does not contain the server configuration, server private key, CA private key, or Easy-RSA database.
-
-WINDOWS
-1. Extract this ZIP on the Windows client.
-2. Open PowerShell as Administrator in the extracted folder.
-3. Run:
-   Set-ExecutionPolicy -Scope Process Bypass -Force
-   .\Install-OpenVPN-Client-Windows.ps1
-The installer uses an existing OpenVPN Community installation, or installs it if missing.
-If an existing installation lacks OpenVPNService, it asks before modifying/upgrading it to add the service and drivers.
-The VPN service is configured to connect at system startup.
-
-LINUX
-1. Extract this ZIP on the Linux client.
-2. From the extracted folder, run:
-   sudo bash ./install-openvpn-client-linux.sh
-The installer uses the distribution package manager if OpenVPN is missing and enables the systemd client service.
-
-SECURITY
-The .ovpn file contains this device's client certificate, private key, CA certificate, and shared TLS control-channel key.
-Treat this whole ZIP as a password-equivalent secret. Transfer it securely, keep it private, and do not reuse it on another device.
-"@
-        [System.IO.File]::WriteAllText((Join-Path $clientPackageDir 'README.txt'), $packageReadme, [System.Text.Encoding]::UTF8)
-
-        $archivePath = Join-Path $packageRoot ($clientName + '.zip')
-        if (Test-Path -LiteralPath $archivePath) { Remove-Item -LiteralPath $archivePath -Force }
-        Compress-Archive -Path (Join-Path $clientPackageDir '*') -DestinationPath $archivePath -CompressionLevel Optimal -Force
-        Write-Info "Client distribution package created: $archivePath"
-    }
-}
-
 # Prepare output structure.
-New-Item -ItemType Directory -Path $Root, $ServerDir, $CcdDir, $ClientsDir -Force | Out-Null
+New-Item -ItemType Directory -Path $ServerHome, $ServerDir, $CcdDir, $PkiDir -Force | Out-Null
 $script:EasyRSAStart = Get-EasyRSAStart
 $script:EasyRSAHome = Split-Path -Parent $script:EasyRSAStart
-$PkiDir = Join-Path $script:EasyRSAHome 'pki'
+New-Item -ItemType Directory -Path $PkiDir -Force | Out-Null
 
 # Easy-RSA inline files duplicate private keys. This kit builds .ovpn profiles
 # itself and uses --noinline, so old generated *.inline files are redundant.
@@ -637,50 +526,14 @@ Write-Info "Updated server config: $serverConfigPath"
 $endpoint = Read-ServerEndpoint
 [System.IO.File]::WriteAllText($EndpointFile, $endpoint + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
 
-# Update existing client profiles if the endpoint changed.
-Get-ChildItem -Path $ClientsDir -Filter '*.ovpn' -File -ErrorAction SilentlyContinue | ForEach-Object {
-    $content = Get-Content -Path $_.FullName -Raw
-    $content = [regex]::Replace($content, '(?m)^remote\s+\S+\s+\d+\s+udp\s*$', "remote $endpoint $script:VpnPort udp", 1)
-    [System.IO.File]::WriteAllText($_.FullName, $content, [System.Text.Encoding]::ASCII)
-}
-
-$firstClient = -not (Get-ChildItem -Path $CcdDir -File -ErrorAction SilentlyContinue | Select-Object -First 1)
-$defaultName = if ($firstClient) { 'phone' } else { 'device' }
-$commonName = Get-ClientCommonName -DefaultName $defaultName
-$vpnAddress = Get-NextVpnAddress
-
-$clientCertPath = Join-Path $PkiDir "issued\$commonName.crt"
-$clientKeyPath = Join-Path $PkiDir "private\$commonName.key"
-if (-not (Test-Path $clientCertPath)) {
-    $clientRequestPath = Join-Path $PkiDir "reqs\$commonName.req"
-    if ((Test-Path $clientKeyPath) -and (Test-Path $clientRequestPath)) {
-        Write-Info "Found the existing key/request for '$commonName'; signing that request now..."
-        Invoke-EasyRSA @('--batch', 'sign-req', 'client', $commonName)
-    }
-    elseif (-not (Test-Path $clientKeyPath) -and -not (Test-Path $clientRequestPath)) {
-        Write-Info "Creating certificate for '$commonName'..."
-        Invoke-EasyRSA @('--batch', 'build-client-full', $commonName, 'nopass')
-    }
-    else {
-        throw "The PKI for '$commonName' is incomplete (only its key or request exists). Inspect the Easy-RSA pki folder before proceeding; nothing was overwritten."
-    }
-}
-if (-not (Test-Path $clientCertPath) -or -not (Test-Path $clientKeyPath)) {
-    throw "Easy-RSA did not produce the certificate/key for $commonName."
-}
-
-$ccdContent = "ifconfig-push $vpnAddress $script:VpnMask`r`n"
-[System.IO.File]::WriteAllText((Join-Path $CcdDir $commonName), $ccdContent, [System.Text.Encoding]::ASCII)
-Write-ClientProfile -CommonName $commonName -Address $vpnAddress -Endpoint $endpoint
-New-ClientDistributionPackages
-
 Write-Host ''
-Write-Host 'Generation complete.' -ForegroundColor Green
+Write-Host "Server configuration '$ServerName' is ready." -ForegroundColor Green
 Write-Host "Server bundle: $ServerDir"
-Write-Host "Client import file: $(Join-Path $ClientsDir "$commonName.ovpn")"
-Write-Host "Client package ZIP: $(Join-Path (Join-Path $Root 'client-packages') "$commonName.zip")"
+Write-Host "PKI (keep private): $PkiDir"
 Write-Host "Server tunnel address: $(Get-ServerVpnAddress)"
-Write-Host "Client tunnel address: $vpnAddress"
+Write-Host "VPN network: $script:VpnNetwork/$script:VpnPrefix"
+Write-Host "UDP port: $script:VpnPort"
 Write-Host ''
-Write-Warn 'The .ovpn profile contains the device private key. Transfer it securely and do not reuse it on another device.'
-Write-Warn ('Forward UDP port ' + $script:VpnPort + ' on your router to this server PC, and keep its LAN address stable.')
+Write-Host 'No client certificates or client profiles were generated.' -ForegroundColor Cyan
+Write-Host 'Run New-OpenVPN-Client.ps1 to select this server and issue a client package.' -ForegroundColor Cyan
+Write-Warn ('Forward UDP ' + $script:VpnPort + ' on your router to this server PC, and keep its LAN address stable.')

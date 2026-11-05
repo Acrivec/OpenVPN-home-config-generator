@@ -1,13 +1,55 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 [CmdletBinding()]
 param(
-    [string]$CommonName
+    [string]$CommonName,
+    [string]$ServerName
 )
 
 $ErrorActionPreference = 'Stop'
-$Root = Join-Path $PSScriptRoot 'OpenVPN-VPN'
-$EasyRSAInstall = Join-Path $Root 'easy-rsa'
-$ServerDir = Join-Path $Root 'server'
+$KitRoot = Join-Path $PSScriptRoot 'OpenVPN-VPN'
+$ServersRoot = Join-Path $KitRoot 'servers'
+$EasyRSAInstall = Join-Path $KitRoot 'easy-rsa'
+$availableServers = @()
+if (Test-Path -LiteralPath $ServersRoot) {
+    $availableServers = @(Get-ChildItem -LiteralPath $ServersRoot -Directory | Where-Object {
+        (Test-Path (Join-Path $_.FullName 'pki\private\ca.key')) -and
+        (Test-Path (Join-Path $_.FullName 'server\server.ovpn'))
+    } | Sort-Object Name)
+}
+if ($availableServers.Count -eq 0 -and (Test-Path -LiteralPath $EasyRSAInstall)) {
+    # Compatibility with a pre-v13 layout before its first server-generator migration.
+    $legacyStart = Get-ChildItem -Path $EasyRSAInstall -Filter 'EasyRSA-Start.bat' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($legacyStart -and (Test-Path (Join-Path (Split-Path -Parent $legacyStart.FullName) 'pki\private\ca.key'))) {
+        $ServerHome = $KitRoot
+        $ServerName = 'legacy'
+    }
+}
+if (-not $ServerHome) {
+    if ([string]::IsNullOrWhiteSpace($ServerName)) {
+        if ($availableServers.Count -eq 0) { throw "No server configurations found under '$ServersRoot'. Run New-OpenVPN-Server.ps1 first." }
+        if ($availableServers.Count -eq 1) { $ServerHome = $availableServers[0].FullName; $ServerName = $availableServers[0].Name }
+        else {
+            Write-Host 'Server configurations:' -ForegroundColor Cyan
+            for ($i = 0; $i -lt $availableServers.Count; $i++) { Write-Host ("  {0}. {1}" -f ($i + 1), $availableServers[$i].Name) }
+            while ($true) {
+                $selection = Read-Host 'Select server number'
+                $selectedIndex = 0
+                if ([int]::TryParse($selection, [ref]$selectedIndex) -and $selectedIndex -ge 1 -and $selectedIndex -le $availableServers.Count) {
+                    $ServerHome = $availableServers[$selectedIndex - 1].FullName
+                    $ServerName = $availableServers[$selectedIndex - 1].Name
+                    break
+                }
+                Write-Warning "Enter a number from 1 to $($availableServers.Count)."
+            }
+        }
+    }
+    else {
+        $match = $availableServers | Where-Object { $_.Name -eq $ServerName } | Select-Object -First 1
+        if (-not $match) { throw "Server configuration '$ServerName' was not found." }
+        $ServerHome = $match.FullName
+    }
+}
+$ServerDir = Join-Path $ServerHome 'server'
 
 if ([string]::IsNullOrWhiteSpace($CommonName)) {
     $CommonName = Read-Host 'Certificate/device name to revoke (example: phone)'
@@ -18,9 +60,10 @@ if ($CommonName -notmatch '^[a-z0-9][a-z0-9_-]{0,31}$') {
 }
 
 $startBat = Get-ChildItem -Path $EasyRSAInstall -Filter 'EasyRSA-Start.bat' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $startBat) { throw "Easy-RSA was not found under $EasyRSAInstall. Run New-OpenVPN-VPN.ps1 first." }
+if (-not $startBat) { throw "Easy-RSA was not found under $EasyRSAInstall. Run New-OpenVPN-Server.ps1 first." }
 $easyRSAHome = Split-Path -Parent $startBat.FullName
-$pkiDir = Join-Path $easyRSAHome 'pki'
+$pkiDir = Join-Path $ServerHome 'pki'
+if (-not (Test-Path $pkiDir)) { $pkiDir = Join-Path $easyRSAHome 'pki' }
 $certPath = Join-Path $pkiDir "issued\$CommonName.crt"
 if (-not (Test-Path $certPath)) { throw "No issued certificate found for '$CommonName'." }
 
@@ -135,8 +178,8 @@ if ($config -notmatch '(?m)^\s*crl-verify\s+') {
 
 # Remove distributable copies so a revoked device package is not accidentally
 # handed out again. Keep the PKI revocation record and CCD reservation intact.
-$clientProfile = Join-Path (Join-Path $Root 'clients') "$CommonName.ovpn"
-$clientPackages = Join-Path $Root 'client-packages'
+$clientProfile = Join-Path (Join-Path $ServerHome 'clients') "$CommonName.ovpn"
+$clientPackages = Join-Path $ServerHome 'client-packages'
 $clientPackageDir = Join-Path $clientPackages $CommonName
 $clientPackageZip = Join-Path $clientPackages "$CommonName.zip"
 foreach ($path in @($clientProfile, $clientPackageDir, $clientPackageZip)) {
@@ -146,10 +189,10 @@ foreach ($path in @($clientProfile, $clientPackageDir, $clientPackageZip)) {
 }
 
 Write-Host ''
-Write-Host "Certificate '$CommonName' revoked and new CRL generated." -ForegroundColor Green
+Write-Host "Certificate '$CommonName' revoked on server '$ServerName' and new CRL generated." -ForegroundColor Green
 Write-Host 'Removed the old .ovpn profile and generated client package from the server output.' -ForegroundColor Green
 Write-Host "CRL: $(Join-Path $ServerDir 'crl.pem')"
-Write-Host 'Deploy the updated server bundle and restart OpenVPN:'
+Write-Host "Deploy the updated '$ServerName' server bundle and restart OpenVPN:"
 Write-Host '  Windows: run Install-OpenVPN-Server-Windows.ps1 as Administrator.'
 Write-Host '  Linux: copy the updated server directory and rerun install-openvpn-server-linux.sh as root.'
 Write-Host 'The CCD entry remains in place so its VPN IP and device name are not accidentally reused.'

@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
@@ -6,6 +6,27 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# PowerShell 5.1 does not always preserve useful line information when a
+# terminating error bubbles out through a .cmd-launched elevated process.
+# Print the originating line and stack explicitly before stopping.
+trap {
+    $failure = $_
+    Write-Host ''
+    Write-Host "CLIENT INSTALLER FAILED: $($failure.Exception.Message)" -ForegroundColor Red
+    $lineNumber = $failure.InvocationInfo.ScriptLineNumber
+    if ($lineNumber -gt 0) {
+        Write-Host "File: $($failure.InvocationInfo.ScriptName)"
+        Write-Host "Line: $lineNumber"
+        if (-not [string]::IsNullOrWhiteSpace($failure.InvocationInfo.Line)) {
+            Write-Host "Code: $($failure.InvocationInfo.Line.Trim())"
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($failure.ScriptStackTrace)) {
+        Write-Host $failure.ScriptStackTrace
+    }
+    break
+}
 
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -35,7 +56,9 @@ foreach ($requiredMarker in @('(?im)^client\s*$', '(?im)^remote\s+', '(?im)^<ca>
     }
 }
 
-$profileName = [IO.Path]::GetFileNameWithoutExtension($ProfilePath).ToLowerInvariant() -replace '[^a-z0-9_-]+', '-'
+$profileBaseName = [IO.Path]::GetFileNameWithoutExtension($ProfilePath)
+if ([string]::IsNullOrWhiteSpace($profileBaseName)) { $profileBaseName = 'device' }
+$profileName = $profileBaseName.ToLowerInvariant() -replace '[^a-z0-9_-]+', '-'
 $profileName = $profileName.Trim('-')
 if ([string]::IsNullOrWhiteSpace($profileName)) { $profileName = 'device' }
 if ($profileName.Length -gt 40) { $profileName = $profileName.Substring(0, 40) }
@@ -57,11 +80,21 @@ if ($openVpnInstalled -and -not $existingService) {
 }
 
 if ($shouldInstallMsi) {
-    $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
-    switch ($architecture) {
-        'x64'   { $msiArchitecture = 'amd64' }
-        'arm64' { $msiArchitecture = 'arm64' }
-        'x86'   { $msiArchitecture = 'x86' }
+    # Use Windows environment variables instead of RuntimeInformation.OSArchitecture.
+    # The latter can be null/unavailable on some Windows PowerShell 5.1 + .NET Framework
+    # combinations, causing a null-valued .ToString() failure before installation starts.
+    $architecture = [string]$env:PROCESSOR_ARCHITEW6432
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = [string]$env:PROCESSOR_ARCHITECTURE
+    }
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        throw 'Could not determine Windows processor architecture from PROCESSOR_ARCHITECTURE.'
+    }
+    switch ($architecture.Trim().ToUpperInvariant()) {
+        'AMD64' { $msiArchitecture = 'amd64' }
+        'X64'   { $msiArchitecture = 'amd64' }
+        'ARM64' { $msiArchitecture = 'arm64' }
+        'X86'   { $msiArchitecture = 'x86' }
         default { throw "Unsupported Windows architecture '$architecture'. Install OpenVPN Community manually, then rerun this client installer." }
     }
 
@@ -204,6 +237,34 @@ else {
 $service = Get-Service -Name 'OpenVPNService'
 if ($service.Status -ne 'Running') {
     throw "OpenVPNService did not remain running (status: $($service.Status)). Check Windows Event Viewer and the OpenVPN logs."
+}
+
+# DCO creates its own virtual network interface. When Windows registers it as a
+# network profile, mark only that OpenVPN DCO interface Private (never Wi-Fi/LAN).
+# The interface may appear only after the service establishes the tunnel.
+Write-Host 'Waiting for the OpenVPN DCO interface so its Windows profile can be set to Private...' -ForegroundColor Cyan
+$dcoProfileSet = $false
+if (Get-Command Get-NetConnectionProfile -ErrorAction SilentlyContinue) {
+    for ($attempt = 0; $attempt -lt 18 -and -not $dcoProfileSet; $attempt++) {
+        try {
+            $dcoProfiles = @(Get-NetConnectionProfile -ErrorAction Stop | Where-Object {
+                $_.InterfaceAlias -match '(?i)OpenVPN.*Data Channel Offload|DCO' -or
+                $_.InterfaceDescription -match '(?i)OpenVPN.*Data Channel Offload|DCO'
+            })
+            foreach ($networkProfile in $dcoProfiles) {
+                if ($networkProfile.NetworkCategory -ne 'Private') {
+                    Set-NetConnectionProfile -InterfaceIndex $networkProfile.InterfaceIndex -NetworkCategory Private -ErrorAction Stop
+                }
+                $dcoProfileSet = $true
+                Write-Host "Set '$($networkProfile.InterfaceAlias)' network category to Private." -ForegroundColor Green
+            }
+        }
+        catch { Write-Warning "Could not set the OpenVPN DCO network category: $($_.Exception.Message)" }
+        if (-not $dcoProfileSet -and $attempt -lt 17) { Start-Sleep -Seconds 5 }
+    }
+}
+if (-not $dcoProfileSet) {
+    Write-Warning 'OpenVPN DCO interface was not yet registered by Windows. After the VPN connects, run Get-NetConnectionProfile and set the OpenVPN Data Channel Offload interface to Private if it remains Public.'
 }
 
 $logDir = [string]$registry.log_dir

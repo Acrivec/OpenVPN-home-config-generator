@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 [CmdletBinding()]
 param(
     [string]$ServerDir
@@ -22,9 +22,32 @@ if (-not (Test-IsAdministrator)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($ServerDir)) {
-    $ServerDir = Join-Path $PSScriptRoot 'OpenVPN-VPN\server'
-    if (-not (Test-Path (Join-Path $ServerDir 'server.ovpn'))) {
-        $ServerDir = Join-Path $PSScriptRoot 'server'
+    $serversRoot = Join-Path $PSScriptRoot 'OpenVPN-VPN\servers'
+    $available = @()
+    if (Test-Path -LiteralPath $serversRoot) {
+        $available = @(Get-ChildItem -LiteralPath $serversRoot -Directory | Where-Object {
+            Test-Path (Join-Path $_.FullName 'server\server.ovpn')
+        } | Sort-Object Name)
+    }
+    if ($available.Count -eq 1) {
+        $ServerDir = Join-Path $available[0].FullName 'server'
+    }
+    elseif ($available.Count -gt 1) {
+        Write-Host 'Available generated server bundles:' -ForegroundColor Cyan
+        for ($i = 0; $i -lt $available.Count; $i++) { Write-Host ("  {0}. {1}" -f ($i + 1), $available[$i].Name) }
+        while ($true) {
+            $choice = Read-Host 'Select server bundle number'
+            $selectedIndex = 0
+            if ([int]::TryParse($choice, [ref]$selectedIndex) -and $selectedIndex -ge 1 -and $selectedIndex -le $available.Count) {
+                $ServerDir = Join-Path $available[$selectedIndex - 1].FullName 'server'
+                break
+            }
+            Write-Warning "Enter a number from 1 to $($available.Count)."
+        }
+    }
+    else {
+        $ServerDir = Join-Path $PSScriptRoot 'OpenVPN-VPN\server'
+        if (-not (Test-Path (Join-Path $ServerDir 'server.ovpn'))) { $ServerDir = Join-Path $PSScriptRoot 'server' }
     }
 }
 $ServerDir = (Resolve-Path -Path $ServerDir).Path

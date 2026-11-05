@@ -1,21 +1,45 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Usage: sudo ./install-openvpn-server-linux.sh [/path/to/OpenVPN-VPN/server]
+# Usage: sudo ./install-openvpn-server-linux.sh /path/to/servers/<server-name>/server
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-  echo "Run as root: sudo $0 [/path/to/server-bundle]" >&2
+  echo "Run as root: sudo $0 /path/to/servers/<server-name>/server" >&2
   exit 1
 fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE_DIR="${1:-"$SCRIPT_DIR/OpenVPN-VPN/server"}"
-if [[ ! -f "$SOURCE_DIR/server.ovpn" ]]; then
-  SOURCE_DIR="$SCRIPT_DIR/server"
+SOURCE_DIR="${1:-}"
+if [[ -z "$SOURCE_DIR" ]]; then
+  shopt -s nullglob
+  candidates=("$SCRIPT_DIR"/OpenVPN-VPN/servers/*/server)
+  valid_candidates=()
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "$candidate/server.ovpn" ]]; then
+      valid_candidates+=("$candidate")
+    fi
+  done
+  if (( ${#valid_candidates[@]} == 1 )); then
+    SOURCE_DIR="${valid_candidates[0]}"
+  elif (( ${#valid_candidates[@]} > 1 )); then
+    echo 'Available server bundles:'
+    for i in "${!valid_candidates[@]}"; do
+      printf '  %d. %s\n' "$((i + 1))" "$(basename "$(dirname "${valid_candidates[$i]}")")"
+    done
+    read -r -p 'Select server number: ' selection
+    if [[ ! "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > ${#valid_candidates[@]} )); then
+      echo 'Invalid selection.' >&2
+      exit 1
+    fi
+    SOURCE_DIR="${valid_candidates[$((selection - 1))]}"
+  else
+    SOURCE_DIR="$SCRIPT_DIR/OpenVPN-VPN/server"
+    [[ -f "$SOURCE_DIR/server.ovpn" ]] || SOURCE_DIR="$SCRIPT_DIR/server"
+  fi
 fi
 if [[ ! -f "$SOURCE_DIR/server.ovpn" ]]; then
   echo "Cannot find server.ovpn in: $SOURCE_DIR" >&2
-  echo "Pass the path to the generated OpenVPN-VPN/server directory as the first argument." >&2
+  echo "Pass the selected servers/<server-name>/server directory as the first argument." >&2
   exit 1
 fi
 for f in ca.crt server.crt server.key tls-crypt.key; do
