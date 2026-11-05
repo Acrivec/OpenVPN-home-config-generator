@@ -72,7 +72,7 @@ $shouldInstallMsi = -not $openVpnInstalled
 if ($openVpnInstalled -and -not $existingService) {
     Write-Warning 'OpenVPN is installed, but its persistent OpenVPNService component is missing.'
     Write-Warning 'The client installer needs that service to connect automatically at system startup.'
-    $approval = Read-Host 'Modify OpenVPN and install the current 2.7.8-I002 service/Wintun components? This may upgrade the existing OpenVPN version. Type Y to continue'
+    $approval = Read-Host 'Modify OpenVPN and install the current 2.7.8-I002 service and network-driver components? This may upgrade the existing OpenVPN version. Type Y to continue'
     if ($approval -notmatch '^(?i:y)$') {
         throw 'No changes made. Install/enable the OpenVPNService component manually, then rerun this client installer.'
     }
@@ -239,32 +239,36 @@ if ($service.Status -ne 'Running') {
     throw "OpenVPNService did not remain running (status: $($service.Status)). Check Windows Event Viewer and the OpenVPN logs."
 }
 
-# DCO creates its own virtual network interface. When Windows registers it as a
-# network profile, mark only that OpenVPN DCO interface Private (never Wi-Fi/LAN).
-# The interface may appear only after the service establishes the tunnel.
-Write-Host 'Waiting for the OpenVPN DCO interface so its Windows profile can be set to Private...' -ForegroundColor Cyan
-$dcoProfileSet = $false
+# OpenVPN 2.7 normally uses DCO; TAP-Windows can be selected as a fallback.
+# Detect OpenVPN-owned interfaces by their driver description instead of
+# assuming a machine-specific adapter alias. Never change Wi-Fi or Ethernet.
+Write-Host 'Waiting for an OpenVPN tunnel interface so its Windows profile can be set to Private...' -ForegroundColor Cyan
+$openVpnProfileSet = $false
 if (Get-Command Get-NetConnectionProfile -ErrorAction SilentlyContinue) {
-    for ($attempt = 0; $attempt -lt 18 -and -not $dcoProfileSet; $attempt++) {
+    for ($attempt = 0; $attempt -lt 18 -and -not $openVpnProfileSet; $attempt++) {
         try {
-            $dcoProfiles = @(Get-NetConnectionProfile -ErrorAction Stop | Where-Object {
-                $_.InterfaceAlias -match '(?i)OpenVPN.*Data Channel Offload|DCO' -or
-                $_.InterfaceDescription -match '(?i)OpenVPN.*Data Channel Offload|DCO'
+            $openVpnProfiles = @(Get-NetConnectionProfile -ErrorAction Stop | ForEach-Object {
+                $networkProfile = $_
+                $adapter = Get-NetAdapter -InterfaceIndex $networkProfile.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($networkProfile.InterfaceAlias -match '(?i)OpenVPN|TAP-Windows' -or
+                    ($adapter -and $adapter.InterfaceDescription -match '(?i)OpenVPN|TAP-Windows')) {
+                    $networkProfile
+                }
             })
-            foreach ($networkProfile in $dcoProfiles) {
+            foreach ($networkProfile in $openVpnProfiles) {
                 if ($networkProfile.NetworkCategory -ne 'Private') {
                     Set-NetConnectionProfile -InterfaceIndex $networkProfile.InterfaceIndex -NetworkCategory Private -ErrorAction Stop
                 }
-                $dcoProfileSet = $true
-                Write-Host "Set '$($networkProfile.InterfaceAlias)' network category to Private." -ForegroundColor Green
+                $openVpnProfileSet = $true
+                Write-Host "Set detected OpenVPN interface '$($networkProfile.InterfaceAlias)' to Private." -ForegroundColor Green
             }
         }
-        catch { Write-Warning "Could not set the OpenVPN DCO network category: $($_.Exception.Message)" }
-        if (-not $dcoProfileSet -and $attempt -lt 17) { Start-Sleep -Seconds 5 }
+        catch { Write-Warning "Could not set an OpenVPN tunnel network category: $($_.Exception.Message)" }
+        if (-not $openVpnProfileSet -and $attempt -lt 17) { Start-Sleep -Seconds 5 }
     }
 }
-if (-not $dcoProfileSet) {
-    Write-Warning 'OpenVPN DCO interface was not yet registered by Windows. After the VPN connects, run Get-NetConnectionProfile and set the OpenVPN Data Channel Offload interface to Private if it remains Public.'
+if (-not $openVpnProfileSet) {
+    Write-Warning 'No OpenVPN tunnel network profile was detected yet. After the VPN connects, run Get-NetConnectionProfile and identify the OpenVPN DCO or TAP-Windows interface if it remains Public.'
 }
 
 $logDir = [string]$registry.log_dir

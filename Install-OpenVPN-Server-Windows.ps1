@@ -6,9 +6,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# The kit uses modern OpenVPN 2.6+ directives. OpenVPN itself is never
+# Windows server mode uses OpenVPN 2.7+ DCO. OpenVPN itself is never
 # downloaded, upgraded, or installed by this script.
-$minimumOpenVPNVersion = [version]'2.6.0'
+$minimumOpenVPNVersion = [version]'2.7.0'
 $recommendedOpenVPNVersion = [version]'2.7.8'
 
 function Test-IsAdministrator {
@@ -63,7 +63,7 @@ $service = Get-Service -Name 'OpenVPNService' -ErrorAction SilentlyContinue
 # This is a configuration/deployment script, not an OpenVPN installer.
 # Never download an MSI, change the installed OpenVPN version, or run msiexec.
 if (-not (Test-Path -LiteralPath $openVpnExe)) {
-    throw "OpenVPN was not found at '$openVpnExe'. This script does not download or install OpenVPN. Install OpenVPN Community (including OpenVPNService and the TAP-Windows driver) manually, then rerun this script."
+    throw "OpenVPN was not found at '$openVpnExe'. This script does not download or install OpenVPN. Install OpenVPN Community 2.7.0 or newer with OpenVPNService and the default network-driver components, then rerun this script."
 }
 if (-not $service) {
     throw "The OpenVPNService system service was not found. This script does not install or repair OpenVPN. Verify that OpenVPN Community was installed with its service component enabled, then rerun."
@@ -78,10 +78,10 @@ if ($null -eq $installedVersion) {
     throw "Could not determine the installed OpenVPN version from: '$versionLine'. No software was installed or changed."
 }
 if ($installedVersion -lt $minimumOpenVPNVersion) {
-    throw "OpenVPN $installedVersion is too old for this kit. OpenVPN 2.6.0 or newer is required. Update OpenVPN manually, then rerun this script. This script will not download or install an MSI."
+    throw "OpenVPN $installedVersion is too old for this kit. OpenVPN 2.7.0 or newer is required for Windows server-mode DCO. Update OpenVPN manually, then rerun this script. This script will not download or install an MSI."
 }
 if ($installedVersion -lt $recommendedOpenVPNVersion) {
-    Write-Warning "Detected OpenVPN $installedVersion. The current recommended release is $recommendedOpenVPNVersion. The kit's Windows configuration uses features supported by OpenVPN 2.6+, so continuing without an automatic upgrade. Update OpenVPN manually when convenient."
+    Write-Warning "Detected OpenVPN $installedVersion. The current recommended release is $recommendedOpenVPNVersion. Windows server-mode DCO is available from OpenVPN 2.7.0. Continuing without an automatic upgrade. Update OpenVPN manually when convenient."
 }
 else {
     Write-Host "Using installed OpenVPN $installedVersion. No OpenVPN download or installation will be attempted." -ForegroundColor Green
@@ -102,51 +102,13 @@ $openVpnLogDir = [Environment]::ExpandEnvironmentVariables($openVpnLogDir.Trim()
 New-Item -ItemType Directory -Path $openVpnLogDir -Force | Out-Null
 $openVpnLog = Join-Path $openVpnLogDir 'server.log'
 
-# Select the existing TAP-Windows interface by its Network Connections alias.
-# The alias is persisted so subsequent installer runs have a useful default.
-$adapterNamePath = Join-Path $configDir 'tap-adapter-name.txt'
-$savedTapAdapterName = ''
-if (Test-Path $adapterNamePath) {
-    $savedTapAdapterName = (Get-Content -Path $adapterNamePath -Raw).Trim()
+# Do not pin a Windows adapter with dev-node. OpenVPN 2.7 selects ovpn-dco
+# by default and falls back to tap-windows6 when the configuration requires it.
+# Remove the legacy per-machine adapter-name cache from earlier kit versions.
+$legacyAdapterNamePath = Join-Path $configDir 'tap-adapter-name.txt'
+if (Test-Path -LiteralPath $legacyAdapterNamePath) {
+    Remove-Item -LiteralPath $legacyAdapterNamePath -Force
 }
-$tapAdapters = @(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
-    Where-Object { $_.InterfaceDescription -match '(?i)TAP[- ]Windows' } |
-    Sort-Object Name)
-if ($tapAdapters.Count -eq 0) {
-    throw 'No TAP-Windows adapter was found. Confirm the OpenVPN TAP-Windows driver is installed, then rerun this installer.'
-}
-Write-Host 'Detected TAP-Windows adapters:' -ForegroundColor Cyan
-foreach ($adapter in $tapAdapters) {
-    Write-Host ("  {0}  [{1}]" -f $adapter.Name, $adapter.InterfaceDescription)
-}
-$defaultTapAdapterName = ''
-if (-not [string]::IsNullOrWhiteSpace($savedTapAdapterName) -and $tapAdapters.Name -contains $savedTapAdapterName) {
-    $defaultTapAdapterName = $savedTapAdapterName
-}
-elseif ($tapAdapters.Count -eq 1) {
-    $defaultTapAdapterName = $tapAdapters[0].Name
-}
-while ($true) {
-    if ([string]::IsNullOrWhiteSpace($defaultTapAdapterName)) {
-        $tapAdapterName = (Read-Host 'Enter the exact TAP-Windows adapter name shown above').Trim()
-    }
-    else {
-        $tapAdapterName = Read-Host "TAP-Windows adapter name [$defaultTapAdapterName]"
-        if ([string]::IsNullOrWhiteSpace($tapAdapterName)) { $tapAdapterName = $defaultTapAdapterName }
-        $tapAdapterName = $tapAdapterName.Trim()
-    }
-    if ([string]::IsNullOrWhiteSpace($tapAdapterName) -or $tapAdapterName -match '["\r\n]') {
-        Write-Warning 'Enter a non-empty adapter name without quotation marks or line breaks.'
-        continue
-    }
-    $selectedTapAdapter = $tapAdapters | Where-Object { $_.Name -eq $tapAdapterName } | Select-Object -First 1
-    if (-not $selectedTapAdapter) {
-        Write-Warning "'$tapAdapterName' is not one of the detected TAP-Windows adapter names. Enter the exact name shown above."
-        continue
-    }
-    break
-}
-[System.IO.File]::WriteAllText($adapterNamePath, $tapAdapterName + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
 
 foreach ($file in @('ca.crt', 'server.crt', 'server.key', 'tls-crypt.key')) {
     $sourcePath = Join-Path $ServerDir $file
@@ -180,9 +142,10 @@ if ([regex]::IsMatch($serverText, '(?m)^[ \t]*status[ \t]+.*$')) {
 else {
     $serverText += "`r`n$statusLine`r`n"
 }
-# Keep the generated server.ovpn portable. Add the Windows-specific dev-node
-# only to the deployed copy so the Linux installer remains unaffected.
+# Keep the runtime config portable and let OpenVPN 2.7 select its driver.
+# Strip legacy directives from bundles generated by earlier kit versions.
 $serverText = [regex]::Replace($serverText, '(?m)^[ \t]*dev-node[ \t]+.*(?:\r?\n|$)', '')
+$serverText = [regex]::Replace($serverText, '(?m)^[ \t]*disable-dco[ \t]*(?:\r?\n|$)', '')
 # Use absolute credential paths so the service cannot resolve tls-crypt.key
 # relative to an unexpected working directory.
 $credentialFiles = @(
@@ -202,8 +165,6 @@ foreach ($credential in $credentialFiles) {
 }
 $devTunMatch = [regex]::Match($serverText, '(?m)^[ \t]*dev[ \t]+tun[ \t]*$')
 if (-not $devTunMatch.Success) { throw 'The generated server.ovpn does not contain the expected "dev tun" directive.' }
-$devNodeDirective = 'dev-node "' + $tapAdapterName + '"'
-$serverText = $serverText.Insert($devTunMatch.Index + $devTunMatch.Length, "`r`n$devNodeDirective")
 $serverText = "cd `"$($configDir.Replace('\','/'))`"`r`n" + $serverText
 $serverConfigPath = Join-Path $configDir 'server.ovpn'
 if (Test-Path $serverConfigPath) {
@@ -253,6 +214,39 @@ $serverPort = [int]$portLine.Matches[0].Groups[1].Value
 $ruleName = "OpenVPN Server UDP $serverPort"
 Get-NetFirewallRule -DisplayName 'OpenVPN Server UDP *' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol UDP -LocalPort $serverPort -Profile Any | Out-Null
+
+# With DCO, client-to-client packets are forwarded by the Windows IP stack.
+# The legacy client-to-client directive remains in the config for TAP fallback,
+# but DCO requires IP routing plus the Routing and Remote Access service.
+$routingRebootRequired = $false
+$clientToClientEnabled = [regex]::IsMatch($serverText, '(?m)^[ \t]*client-to-client[ \t]*(?:#.*)?$')
+if ($clientToClientEnabled) {
+    $tcpipParameters = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
+    try {
+        $ipEnableRouter = (Get-ItemProperty -Path $tcpipParameters -Name IPEnableRouter -ErrorAction SilentlyContinue).IPEnableRouter
+        if ([int]$ipEnableRouter -ne 1) {
+            New-ItemProperty -Path $tcpipParameters -Name IPEnableRouter -PropertyType DWord -Value 1 -Force | Out-Null
+            $routingRebootRequired = $true
+            Write-Host 'Enabled Windows IP forwarding for DCO client-to-client routing.' -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Warning "Could not enable Windows IP forwarding: $($_.Exception.Message). VPN clients may not be able to reach one another while DCO is active."
+    }
+
+    try {
+        $remoteAccess = Get-Service -Name 'RemoteAccess' -ErrorAction Stop
+        $remoteAccessCim = Get-CimInstance -ClassName Win32_Service -Filter "Name='RemoteAccess'" -ErrorAction Stop
+        if ($remoteAccessCim.StartMode -ne 'Auto') {
+            Set-Service -Name 'RemoteAccess' -StartupType Automatic -ErrorAction Stop
+            $routingRebootRequired = $true
+            Write-Host 'Set Routing and Remote Access service to Automatic for DCO forwarding.' -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Warning "Could not configure the Windows Routing and Remote Access service: $($_.Exception.Message). VPN clients may not be able to reach one another while DCO is active."
+    }
+}
 
 Set-Service -Name 'OpenVPNService' -StartupType Automatic
 $openVpnStartTime = Get-Date
@@ -311,47 +305,72 @@ do {
 if ($daemonInitialized) {
     Write-Host 'OpenVPN daemon initialized successfully.' -ForegroundColor Green
 
-    $selectedTapAdapter = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -eq $tapAdapterName -and $_.InterfaceDescription -match '(?i)TAP[- ]Windows' } |
-        Select-Object -First 1
-
-    if (-not $selectedTapAdapter) {
-        Write-Warning "OpenVPN initialized, but the selected TAP adapter '$tapAdapterName' is not currently visible to Get-NetAdapter."
+    # Match the live VPN interface by the server address derived from the
+    # generated server subnet. This works with DCO's on-demand adapter and
+    # with the TAP-Windows fallback, without assuming an adapter alias.
+    $serverDirective = [regex]::Match(
+        $serverText,
+        '(?m)^[ \t]*server[ \t]+(?<network>(?:\d{1,3}\.){3}\d{1,3})[ \t]+(?<mask>(?:\d{1,3}\.){3}\d{1,3})(?:[ \t]+nopool)?[ \t]*$'
+    )
+    if (-not $serverDirective.Success) {
+        Write-Warning 'OpenVPN initialized, but the server subnet could not be parsed; the adapter network category was not changed.'
     }
     else {
-        # Windows may take a moment to publish the connection profile after
-        # OpenVPN opens/configures the TAP device. Match by the chosen alias.
-        $vpnProfile = $null
-        $profileDeadline = (Get-Date).AddSeconds(5)
-        do {
-            $vpnProfile = Get-NetConnectionProfile -InterfaceAlias $tapAdapterName -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-            if ($vpnProfile) { break }
-            Start-Sleep -Seconds 1
-        } while ((Get-Date) -lt $profileDeadline)
-
-        if ($vpnProfile) {
-            if ($vpnProfile.NetworkCategory -eq 'DomainAuthenticated') {
-                Write-Host "OpenVPN TAP adapter '$tapAdapterName': DomainAuthenticated (managed by domain policy)." -ForegroundColor Yellow
+        $networkBytes = [System.Net.IPAddress]::Parse($serverDirective.Groups['network'].Value).GetAddressBytes()
+        # With topology subnet, OpenVPN assigns the first usable address to the server.
+        $carry = 1
+        for ($byteIndex = 3; $byteIndex -ge 0 -and $carry -eq 1; $byteIndex--) {
+            $nextValue = [int]$networkBytes[$byteIndex] + 1
+            if ($nextValue -gt 255) {
+                $networkBytes[$byteIndex] = [byte]0
             }
             else {
-                if ($vpnProfile.NetworkCategory -ne 'Private') {
-                    Set-NetConnectionProfile -InterfaceAlias $tapAdapterName -NetworkCategory Private -ErrorAction Stop
-                }
-                Write-Host "OpenVPN TAP adapter '$tapAdapterName' network profile: Private." -ForegroundColor Green
+                $networkBytes[$byteIndex] = [byte]$nextValue
+                $carry = 0
             }
         }
+        if ($carry -eq 1) { throw 'Could not calculate the server tunnel IPv4 address from the configured subnet.' }
+        $serverTunnelAddress = ([System.Net.IPAddress]::new([byte[]]$networkBytes)).ToString()
+        Write-Host "Looking for the VPN interface by its server tunnel address ($serverTunnelAddress)..." -ForegroundColor Cyan
+
+        $serverTunnelIp = $null
+        $vpnAdapter = $null
+        $adapterDeadline = (Get-Date).AddSeconds(15)
+        do {
+            $serverTunnelIp = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $serverTunnelAddress -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($serverTunnelIp) {
+                $vpnAdapter = Get-NetAdapter -InterfaceIndex $serverTunnelIp.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($vpnAdapter) { break }
+            }
+            Start-Sleep -Seconds 1
+        } while ((Get-Date) -lt $adapterDeadline)
+
+        if (-not $serverTunnelIp -or -not $vpnAdapter) {
+            Write-Warning "OpenVPN initialized, but Windows has not exposed an adapter with server tunnel address $serverTunnelAddress. No network category was changed."
+            Write-Host 'Current IPv4 addresses:' -ForegroundColor Yellow
+            Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Format-Table IPAddress, InterfaceAlias, InterfaceIndex, PrefixLength -AutoSize
+        }
         else {
-            $adapterAddresses = @(Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $selectedTapAdapter.ifIndex -ErrorAction SilentlyContinue |
-                ForEach-Object { '{0}/{1}' -f $_.IPAddress, $_.PrefixLength })
-            $addressSummary = if ($adapterAddresses.Count -gt 0) { $adapterAddresses -join ', ' } else { '(no IPv4 address reported)' }
-            Write-Warning "OpenVPN initialized, but Windows has not exposed a connection profile for '$tapAdapterName' yet. This is not waiting for a phone/client connection. Adapter status: $($selectedTapAdapter.Status); IPv4: $addressSummary."
-            Write-Host 'Current TAP profiles:' -ForegroundColor Yellow
-            Get-NetConnectionProfile -ErrorAction SilentlyContinue | Format-Table InterfaceAlias, NetworkCategory, IPv4Connectivity -AutoSize
-            Write-Host 'Adapter details:' -ForegroundColor Yellow
-            Get-NetAdapter -Name $tapAdapterName -ErrorAction SilentlyContinue | Format-List Name, InterfaceDescription, Status, ifIndex
-            Write-Host 'You can retry the profile change later with:' -ForegroundColor Yellow
-            Write-Host "Set-NetConnectionProfile -InterfaceAlias '$tapAdapterName' -NetworkCategory Private"
+            $vpnProfile = Get-NetConnectionProfile -InterfaceIndex $vpnAdapter.ifIndex -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($vpnProfile) {
+                if ($vpnProfile.NetworkCategory -eq 'DomainAuthenticated') {
+                    Write-Host "VPN adapter '$($vpnAdapter.Name)' ($serverTunnelAddress): DomainAuthenticated (managed by domain policy)." -ForegroundColor Yellow
+                }
+                else {
+                    if ($vpnProfile.NetworkCategory -ne 'Private') {
+                        Set-NetConnectionProfile -InterfaceIndex $vpnAdapter.ifIndex -NetworkCategory Private -ErrorAction Stop
+                    }
+                    Write-Host "VPN adapter '$($vpnAdapter.Name)' ($serverTunnelAddress) network profile: Private." -ForegroundColor Green
+                }
+            }
+            else {
+                Write-Warning "The VPN adapter '$($vpnAdapter.Name)' has the expected address $serverTunnelAddress, but Windows has not published its connection profile yet."
+                Write-Host 'Adapter details:' -ForegroundColor Yellow
+                $vpnAdapter | Format-List Name, InterfaceDescription, Status, ifIndex
+                Write-Host 'You can retry the profile change later with:' -ForegroundColor Yellow
+                Write-Host "Set-NetConnectionProfile -InterfaceIndex $($vpnAdapter.ifIndex) -NetworkCategory Private"
+            }
         }
     }
 }
@@ -391,6 +410,9 @@ Write-Host "Logs: $openVpnLogDir"
 Write-Host 'Startup type: Automatic (system service; does not depend on a user logon).'
 Write-Host ''
 Write-Warning ('Router step still required: forward UDP {0} to this PC''s LAN IPv4 address. Reserve that LAN address in DHCP.' -f $serverPort)
+if ($routingRebootRequired) {
+    Write-Warning 'Windows IP-routing settings changed. Reboot this PC to apply them; DCO client-to-client forwarding may not work until after the reboot.'
+}
 Write-Host 'CA private key intentionally not installed: server runtime uses ca.crt (public), not ca.key (signing key).' -ForegroundColor DarkGray
 if ($service.Status -ne 'Running') {
     Write-Warning 'The service did not remain running. Inspect the OpenVPN log directory and Windows Event Viewer > Application.'

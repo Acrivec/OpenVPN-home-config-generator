@@ -516,7 +516,6 @@ tls-crypt tls-crypt.key
 remote-cert-tls client
 tls-version-min 1.2
 data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
-disable-dco
 status openvpn-status.log
 verb 3
 "@
